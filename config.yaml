@@ -1,0 +1,50 @@
+wikis:
+  - enwiki
+  - dewiki
+  - frwiki
+  - jawiki
+  - eswiki
+
+dump_date: "20260201"
+
+paths:
+  dumps: "data/dumps"
+  parquet: "data/parquet"
+  results: "data/results"
+
+spark:
+  driver_memory: "4g"
+  executor_memory: "4g"
+
+kafka:
+  bootstrap_servers: "localhost:9092"
+  topic: "wiki-edits"
+
+streaming:
+  window_duration: "1 hour"
+  watermark: "2 hours"
+  top_k: 20
+
+bloom_filter:
+  bit_array_size: 1000000
+  num_hash_functions: 7
+
+fm_sketch:
+  num_hash_functions: 64
+
+minhash:
+  num_hash_functions: 128
+  prime: 4294967311
+
+lsh:
+  bands: 32
+  rows_per_band: 4
+
+eventstreams:
+  url: "https://stream.wikimedia.org/v2/stream/recentchange"
+  filter_wikis:
+    - enwiki
+    - dewiki
+    - frwiki
+    - jawiki
+    - eswiki

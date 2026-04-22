@@ -1,0 +1,10 @@
+data/
+*.xml.gz
+*.parquet
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+checkpoint/
+spark-warehouse/
+metastore_db/
