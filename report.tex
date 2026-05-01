@@ -1,0 +1,712 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{multirow}
+
+\graphicspath{{data/results/}}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single
+}
+
+\begin{document}
+
+\title{Wikipedia Real-Time Edit Stream Analytics:\\
+Batch Processing, Streaming, and Probabilistic Data Structures at Scale}
+
+\author{
+  \IEEEauthorblockN{Dipin Jassal}
+  \IEEEauthorblockA{\textit{Big Data Tech \& Apps} \\
+  018429346}
+  \and
+  \IEEEauthorblockN{Sarvesh}
+  \IEEEauthorblockA{\textit{Big Data Tech \& Apps} \\
+  019129357}
+  \and
+  \IEEEauthorblockN{Anushka}
+  \IEEEauthorblockA{\textit{Big Data Tech \& Apps} \\
+  018383963}
+  \and
+  \IEEEauthorblockN{Ishan}
+  \IEEEauthorblockA{\textit{Big Data Tech \& Apps} \\
+  019107569}
+  \and
+  \IEEEauthorblockN{Samruddhi}
+  \IEEEauthorblockA{\textit{Big Data Tech \& Apps} \\
+  018452122}
+}
+
+\maketitle
+
+
+\begin{abstract}
+We present a large-scale analytics pipeline for Wikipedia editing activity spanning five language editions: English, German, French, Japanese, and Spanish. The system combines Apache Spark batch processing on historical XML dumps (101 million total revisions), Spark Structured Streaming on the Wikimedia EventStreams feed, and three probabilistic data structures implemented from scratch: Bloom Filter, Flajolet-Martin (FM) Sketch, and MinHash with Locality Sensitive Hashing (LSH). We answer three core questions: (1) Which articles are trending in real time? (2) How many distinct editors contribute to each article? (3) Which Wikipedia language editions share editor communities? Our results show that editor communities are largely disjoint across language editions (Jaccard similarity 1.7--6.1\%), that the FM Sketch estimates distinct editors with approximately 42\% MAPE at $k=64$ hash functions while using only 256 bytes of memory, and that a 1M-bit Bloom Filter with $k=7$ hash functions achieves a false positive rate below 0.001 while consuming 125\,KB versus approximately 500\,KB for an exact Python set. A Streamlit dashboard provides interactive visualization of all results. We additionally apply k-anonymity to the editor dataset using (wiki, year, edit\_bucket) as quasi-identifiers; zero groups are suppressed at $k=10$, confirming that Wikipedia's scale makes the aggregate data inherently privacy-preserving.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Apache Spark, probabilistic data structures, Bloom Filter, Flajolet-Martin Sketch, MinHash, LSH, Wikipedia, streaming analytics, Kafka, k-anonymity, privacy
+\end{IEEEkeywords}
+
+%--------------------------------------------------
+\section{Introduction}
+
+Wikipedia is one of the largest collaboratively edited knowledge bases in existence, with millions of revisions made across hundreds of language editions every month. Understanding editorial patterns -- who edits, how often, which articles attract the most attention, and whether editor communities overlap across language boundaries -- has implications for knowledge gap analysis, vandalism detection, and community health monitoring.
+
+This project builds an end-to-end analytics system addressing three questions:
+\begin{enumerate}
+  \item \textbf{Real-time trending:} Which articles are being edited most heavily in the current hour?
+  \item \textbf{Cardinality estimation:} How many distinct editors has each article attracted, without storing the full editor set?
+  \item \textbf{Community overlap:} Do editors who contribute to one language edition also contribute to others?
+\end{enumerate}
+
+To answer these at scale, we use Apache Spark for both batch and streaming computation, Kafka for message queuing, and implement three probabilistic data structures from scratch: a Bloom Filter for new-vs-returning editor classification, a Flajolet-Martin Sketch for distinct editor cardinality estimation, and MinHash with LSH for approximate Jaccard similarity between editor communities.
+
+%--------------------------------------------------
+\section{Related Work}
+
+Probabilistic data structures have been extensively studied for large-scale stream processing. The Bloom Filter \cite{bloom1970} provides membership testing with no false negatives at a tunable false positive rate, consuming $O(m)$ bits for $m$-bit array size. The Flajolet-Martin algorithm \cite{flajolet1985} introduced the trailing-zero trick for cardinality estimation; modern deployments typically use HyperLogLog \cite{flajolet2007}, which achieves under 2\% error and is implemented in Apache Spark's \texttt{approx\_count\_distinct}. MinHash \cite{broder1997} enables approximate Jaccard similarity estimation, and combined with LSH banding \cite{indyk1998} produces an efficient candidate-pair generation strategy that scales to millions of sets.
+
+Wikipedia's editing data has been analyzed for vandalism \cite{potthast2008}, editor community structure \cite{welser2011}, and knowledge gaps \cite{callahan2011}. Our work complements these by building a real-time pipeline rather than a static analysis.
+
+%--------------------------------------------------
+\section{System Architecture}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{architecture.png}
+  \caption{System Architechture}
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{Overview}
+
+The pipeline consists of four layers: data ingestion, batch processing, stream processing, and evaluation. Two data sources feed the system: monthly XML dumps for historical batch analysis, and the live Wikimedia EventStreams feed for real-time streaming. Results from both paths are served through a Streamlit dashboard.
+
+\subsection{Data Sources}
+
+\textbf{Batch:} We use Wikimedia stub-meta-history XML dumps for five language editions (enwiki, dewiki, frwiki, eswiki, jawiki), dump date February 2026. These files contain full revision metadata -- page title, revision ID, timestamp, contributor ID and name, edit comment, and byte size -- without article text. Compressed sizes range from approximately 800\,MB (jawiki) to several gigabytes (enwiki, dewiki).
+
+\textbf{Streaming:} The Wikimedia EventStreams feed (\texttt{stream.wikimedia.org/v2/stream/recentchange}) provides a Server-Sent Events (SSE) stream of every live edit across all Wikimedia projects, generating approximately 6,000--10,000 events per minute globally.
+
+\subsection{Ingestion}
+
+The XML dumps are gzip-compressed and therefore unsplittable by Spark. Loading them with spark-xml places the entire decompression burden on a single executor, causing out-of-memory failures. We instead use Python's \texttt{xml.etree.ElementTree.iterparse} with a streaming PyArrow Parquet writer, flushing every 50,000 rows to maintain constant memory usage. This produces one Parquet file per wiki, Snappy-compressed.
+
+For the live stream, \texttt{sseclient-py} 1.9.0 has an incompatible API for the required connection headers. We implement a custom SSE parser using \texttt{requests.get(stream=True)} with \texttt{iter\_lines()}, which correctly sends the Wikimedia-required \texttt{User-Agent} header and handles automatic reconnection when the 15-minute Wikimedia timeout fires.
+
+%--------------------------------------------------
+\section{Data Characteristics}
+
+Table~\ref{tab:wikistats} summarizes the five corpora after ingestion and filtering (namespace 0, registered editors only).
+
+\begin{table}[htbp]
+\caption{Wikipedia Corpus Statistics (February 2026 Dumps)}
+\label{tab:wikistats}
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Wiki} & \textbf{Revisions} & \textbf{Editors} & \textbf{Avg Bytes/Edit} \\
+\midrule
+enwiki & 26,165,118 & 1,402,943 & 59,624 \\
+dewiki & 26,108,033 &   456,642 & 28,477 \\
+frwiki & 24,847,986 &   466,044 & 32,813 \\
+eswiki & 14,772,589 &   470,050 & 41,512 \\
+jawiki &  9,921,647 &   246,557 & 36,243 \\
+\midrule
+\textbf{Total} & \textbf{101,815,373} & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fig.~\ref{fig:edit_volume} shows the total edit volume per wiki, and Fig.~\ref{fig:yearly} shows how annual edit activity has evolved since 2010.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{01_edit_volume.png}
+  \caption{Total revision count per Wikipedia language edition.}
+  \label{fig:edit_volume}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{01_yearly_edits.png}
+  \caption{Yearly edit volume per wiki (2010 onwards). Edit activity peaked around 2007--2014 and has since stabilized.}
+  \label{fig:yearly}
+\end{figure}
+
+English Wikipedia is the largest by editor count (1.4 million) but has the lowest average edits per editor (18.7), while German Wikipedia shows the highest editor productivity at 57.2 edits per editor on average. Table~\ref{tab:productivity} summarizes editor productivity, and Fig.~\ref{fig:editor_dist} shows the distribution of edits per editor.
+
+\begin{table}[htbp]
+\caption{Editor Productivity per Wiki}
+\label{tab:productivity}
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Wiki} & \textbf{Total Editors} & \textbf{Avg Edits/Editor} \\
+\midrule
+enwiki & 1,402,943 & 18.65 \\
+dewiki &   456,642 & 57.17 \\
+frwiki &   466,044 & 53.32 \\
+eswiki &   470,050 & 31.43 \\
+jawiki &   246,557 & 40.24 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{01_editor_distribution.png}
+  \caption{Distribution of edits per editor per wiki. All wikis follow a heavy-tailed (Pareto) distribution.}
+  \label{fig:editor_dist}
+\end{figure}
+
+Fig.~\ref{fig:storage} compares the size of the source XML.gz dumps against the processed Parquet files.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{01_storage_comparison.png}
+  \caption{Storage size comparison: XML.gz dumps vs Parquet (Snappy). Parquet is smaller after filtering to namespace 0 metadata only.}
+  \label{fig:storage}
+\end{figure}
+
+Table~\ref{tab:toparticles} lists the most-edited articles per wiki, revealing cultural priorities in each community.
+
+\begin{table}[htbp]
+\caption{Top-3 Most-Edited Articles per Wiki}
+\label{tab:toparticles}
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Wiki} & \textbf{Article} & \textbf{Edits} \\
+\midrule
+enwiki & India                      & 24,682 \\
+enwiki & United Kingdom             & 23,516 \\
+enwiki & George Washington          & 22,324 \\
+\midrule
+dewiki & Schweinfurt                & 13,263 \\
+dewiki & Adolf Hitler               & 10,920 \\
+dewiki & Liste von Pseudonymen      & 10,246 \\
+\midrule
+frwiki & Olympique de Marseille     & 10,847 \\
+frwiki & France                     &  9,745 \\
+frwiki & Roger Federer              &  8,662 \\
+\midrule
+eswiki & Club Atletico Boca Juniors & 14,943 \\
+eswiki & Club Atletico River Plate  & 14,748 \\
+eswiki & Gustavo Cerati             & 12,985 \\
+\midrule
+jawiki & Mizuki Nana log            &  3,356 \\
+jawiki & Rikkyo University          &  3,348 \\
+jawiki & Okaasan to Issho           &  3,337 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%--------------------------------------------------
+\section{Probabilistic Data Structures}
+
+\subsection{Bloom Filter}
+
+A Bloom Filter \cite{bloom1970} uses a $m$-bit array and $k$ independent hash functions to support approximate set membership queries. Adding an element sets $k$ bit positions; querying checks all $k$ positions. False negatives are impossible; the theoretical false positive rate is:
+\begin{equation}
+  P_{fp} = \left(1 - e^{-kn/m}\right)^k
+\end{equation}
+where $n$ is the number of inserted elements.
+
+We implement the Bloom Filter from scratch using a bytearray for the bit array and MurmurHash3 with varying seeds for the $k$ hash functions. In the streaming pipeline, a per-window Bloom Filter classifies each incoming editor as new (first appearance in this window) or returning.
+
+Fig.~\ref{fig:bloom_fp} compares theoretical and empirical false positive rates across bit array sizes and hash function counts, and Fig.~\ref{fig:bloom_mem} shows memory usage relative to an exact Python set.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{02_bloom_fp_rates.png}
+  \caption{Bloom Filter false positive rate: theoretical vs empirical. Left: varying bit array size $m$ with $k=7$. Right: varying $k$ with $m=1$M. Empirical results match theory closely.}
+  \label{fig:bloom_fp}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{02_bloom_memory.png}
+  \caption{Memory usage: Bloom Filter vs exact Python set for 10,000 editor IDs. A 1M-bit filter uses 125\,KB vs approximately 500\,KB for an exact set.}
+  \label{fig:bloom_mem}
+\end{figure}
+
+Table~\ref{tab:bloom} summarizes the results at $k=7$ across bit array sizes.
+
+\begin{table}[htbp]
+\caption{Bloom Filter False Positive Rate ($k=7$, $n=10{,}000$)}
+\label{tab:bloom}
+\centering
+\begin{tabular}{rrrr}
+\toprule
+$m$ & Theoretical $P_{fp}$ & Empirical $P_{fp}$ & Memory \\
+\midrule
+100K & $8.19\times10^{-3}$ & 0.0072 & 12.5\,KB \\
+500K & $6.49\times10^{-7}$ & 0.0000 & 62.5\,KB \\
+1M   & $6.46\times10^{-9}$ & 0.0000 & 125\,KB  \\
+5M   & $1.00\times10^{-13}$ & 0.0000 & 625\,KB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $m=1\text{M}$, $k=7$, the filter uses 125\,KB versus approximately 500\,KB for an exact Python set of 10,000 integer editor IDs -- a 4$\times$ memory reduction with effectively zero false positives.
+
+\subsection{Flajolet-Martin Sketch}
+
+The FM Sketch \cite{flajolet1985} estimates cardinality by observing the maximum number of trailing zeros in the binary representation of hash values. For a set of $n$ distinct elements, the maximum trailing zeros $R$ satisfies $\mathbb{E}[2^R] \approx 0.77351 \cdot n$.
+
+Using $k$ independent hash functions and stochastic averaging (grouping into sets of 8, taking the median within each group, then the mean across groups) reduces variance. We implement the sketch from scratch using \texttt{mmh3} for hashing and NumPy for vectorized trailing-zero computation.
+
+Fig.~\ref{fig:fm_scatter} shows FM estimates against exact distinct editor counts, Fig.~\ref{fig:fm_mape} shows how MAPE changes with $k$, and Fig.~\ref{fig:fm_hist} shows the distribution of per-article errors.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{03_fm_scatter.png}
+  \caption{FM Sketch estimate vs exact distinct editor count ($k=64$). Points cluster around the $y=x$ line, with higher error at lower cardinalities.}
+  \label{fig:fm_scatter}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{03_fm_mape_vs_k.png}
+  \caption{FM Sketch MAPE vs number of hash functions $k$. Error decreases roughly as $1/\sqrt{k}$ and plateaus around $k=128$.}
+  \label{fig:fm_mape}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{03_fm_error_histogram.png}
+  \caption{Distribution of per-article FM Sketch errors at $k=64$. The majority of articles fall within 20--60\% error.}
+  \label{fig:fm_hist}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{03_fm_mape_per_wiki.png}
+  \caption{FM Sketch MAPE broken down by wiki ($k=64$). Error is consistent across language editions.}
+  \label{fig:fm_wiki}
+\end{figure}
+
+Table~\ref{tab:fm} shows MAPE against Spark's exact \texttt{countDistinct} across 400 articles per wiki for varying $k$.
+
+\begin{table}[htbp]
+\caption{FM Sketch Accuracy vs Number of Hash Functions}
+\label{tab:fm}
+\centering
+\begin{tabular}{rrrr}
+\toprule
+$k$ & MAPE (\%) & Max Error (\%) & Memory \\
+\midrule
+16  & 52.97 & 368.00 & 64\,B  \\
+32  & 46.54 & 195.35 & 128\,B \\
+64  & 42.79 & 177.40 & 256\,B \\
+128 & 41.39 & 113.93 & 512\,B \\
+256 & 44.23 &  88.57 & 1\,KB  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $k=64$, the sketch uses only 256 bytes while achieving approximately 43\% MAPE -- acceptable for trend detection and cardinality monitoring in streaming contexts. Spark's built-in HyperLogLog achieves under 2\% error at RSD=0.05.
+
+\subsection{MinHash and LSH}
+
+MinHash \cite{broder1997} estimates the Jaccard similarity between two sets $A$ and $B$:
+\begin{equation}
+  J(A, B) = \frac{|A \cap B|}{|A \cup B|}
+\end{equation}
+by computing signatures using $n$ hash functions of the form $h(x) = (ax + b) \bmod p$ where $p$ is a large prime. The probability that two sets agree on any single hash function equals their Jaccard similarity.
+
+LSH banding \cite{indyk1998} divides the $n$-element signature into $b$ bands of $r$ rows each. Two sets are candidate pairs if they agree on all $r$ rows in at least one band. The detection probability is:
+\begin{equation}
+  P(\text{detect}) = 1 - \left(1 - s^r\right)^b
+\end{equation}
+where $s$ is the true Jaccard similarity.
+
+We use $n=128$ hash functions. Fig.~\ref{fig:jaccard} shows the cross-wiki Jaccard similarity heatmaps (exact and MinHash), Fig.~\ref{fig:lsh_curve} shows the LSH detection probability curves, Fig.~\ref{fig:lsh_pr} shows precision and recall at each band configuration, and Fig.~\ref{fig:minhash_synthetic} validates MinHash accuracy on synthetic sets with controlled perturbation.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{04_jaccard_heatmaps.png}
+  \caption{Cross-wiki editor community Jaccard similarity. Left: exact. Right: MinHash estimate ($n=128$). All values are below 0.07, indicating largely disjoint editor communities.}
+  \label{fig:jaccard}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{04_lsh_detection_curve.png}
+  \caption{LSH detection probability $P(\text{detect})$ vs true Jaccard similarity for four band/row configurations. The shaded region marks the actual Jaccard range of our wiki pairs (1.7--6.1\%). Only $b=128$, $r=1$ achieves meaningful detection in this range.}
+  \label{fig:lsh_curve}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{04_lsh_precision_recall.png}
+  \caption{LSH precision and recall at four band/row configurations. Only $b=128$, $r=1$ achieves full recall; coarser configurations miss all pairs due to the low Jaccard regime.}
+  \label{fig:lsh_pr}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{04_minhash_synthetic.png}
+  \caption{MinHash accuracy on synthetic perturbed sets. Each point is a set modified by removing and adding a controlled fraction of elements. Points cluster closely around $y=x$ (perfect estimate), confirming low MAE.}
+  \label{fig:minhash_synthetic}
+\end{figure}
+
+Table~\ref{tab:jaccard} shows exact and MinHash-estimated Jaccard similarity between all wiki pairs, and Table~\ref{tab:lshpr} shows LSH precision and recall at each configuration.
+
+\begin{table}[htbp]
+\caption{Cross-Wiki Editor Community Jaccard Similarity ($n=128$)}
+\label{tab:jaccard}
+\centering
+\begin{tabular}{llrr}
+\toprule
+\textbf{Wiki A} & \textbf{Wiki B} & \textbf{Exact} & \textbf{MinHash} \\
+\midrule
+dewiki & jawiki & 0.0614 & 0.0234 \\
+dewiki & frwiki & 0.0604 & 0.0625 \\
+frwiki & jawiki & 0.0467 & 0.0625 \\
+dewiki & eswiki & 0.0402 & 0.0547 \\
+eswiki & frwiki & 0.0374 & 0.0234 \\
+eswiki & jawiki & 0.0306 & 0.0391 \\
+dewiki & enwiki & 0.0254 & 0.0234 \\
+enwiki & frwiki & 0.0232 & 0.0000 \\
+enwiki & eswiki & 0.0191 & 0.0313 \\
+enwiki & jawiki & 0.0175 & 0.0156 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\caption{LSH Precision and Recall at Different Band Configurations}
+\label{tab:lshpr}
+\centering
+\begin{tabular}{rrrr}
+\toprule
+$b$ & $r$ & Precision & Recall \\
+\midrule
+16  & 8 & 0.00 & 0.00 \\
+32  & 4 & 0.00 & 0.00 \\
+64  & 2 & 0.00 & 0.00 \\
+128 & 1 & 0.22 & 1.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+With Jaccard values below 0.07, coarse banding misses all candidate pairs. Only $b=128$, $r=1$ achieves full recall at the cost of 22\% precision due to hash collisions. This motivates using $n \geq 256$ hash functions or a lower similarity threshold for this domain.
+
+%--------------------------------------------------
+\section{Batch Processing}
+
+Apache Spark batch jobs operate on the full Parquet dataset (101M revisions). Key analyses:
+
+\textbf{HyperLogLog vs exact countDistinct:} Spark's \texttt{approx\_count\_distinct} (HyperLogLog) at RSD=0.05 achieves a mean absolute error of approximately 1.5\% against exact \texttt{countDistinct} across the top 100 most-edited articles. At RSD=0.10 the error rises to approximately 7\%, confirming the accuracy-precision tradeoff. As a concrete example, for \textit{World War II} (5,176 exact distinct editors), HLL at RSD=0.05 estimates 5,272 (+1.9\%).
+
+\textbf{Yearly edit volume:} Edit volume peaked between 2007 and 2014 across all five wikis, with a gradual decline thereafter. French Wikipedia shows the most stable recent activity (730K revisions in 2024, 740K in 2025). Japanese Wikipedia declined from a peak of 548K in 2010 to a trough of 299K in 2014, then stabilized around 350--450K annually.
+
+\textbf{Editor productivity:} Editor activity follows a heavy-tailed distribution across all wikis. German Wikipedia's high average edits per editor (57.2) suggests a concentrated, highly active core community, while English Wikipedia's lower average (18.7) reflects a broader, more casual contributor base.
+
+%--------------------------------------------------
+\section{Stream Processing}
+
+The streaming pipeline consumes live Wikipedia edits from Kafka using Spark Structured Streaming with 1-hour tumbling windows and a 2-hour watermark for late-arriving events.
+
+\textbf{Top-K trending:} The pipeline ranks articles by edit count within each window and stores the top 20 per wiki. During testing (April 2026), trending articles in dewiki included topics related to international current events, consistent with the near-real-time nature of Wikipedia editing.
+
+\textbf{Bloom Filter in streaming:} Each 1-hour window maintains a per-wiki Bloom Filter ($m=1{,}000{,}000$, $k=7$) to classify editors as new or returning. In a 50,000-event simulation on real editor data, zero false positives were observed (theoretical rate: 0.02\%).
+
+\textbf{FM Sketch in streaming:} An FM Sketch ($k=64$) tracks estimated distinct editors per wiki per window, providing cardinality estimates without storing the full editor list. Memory per wiki per window: 256 bytes.
+
+%--------------------------------------------------
+\section{Scaling Analysis}
+
+Fig.~\ref{fig:minhash_runtime} shows MinHash runtime scaling with number of hash functions, Fig.~\ref{fig:fm_runtime} shows FM Sketch runtime scaling, Fig.~\ref{fig:bloom_throughput} shows Bloom Filter streaming throughput overhead, and Fig.~\ref{fig:scaling_wikis} shows pipeline runtime as more wikis are added.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{05_minhash_runtime.png}
+  \caption{MinHash signature computation runtime vs number of hash functions on 100K enwiki editors. Runtime is linear in $n$, confirming $O(n \cdot |S|)$ complexity.}
+  \label{fig:minhash_runtime}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{05_fm_runtime.png}
+  \caption{FM Sketch runtime vs number of hash functions $k$ on 50K elements. Runtime is linear in $k$.}
+  \label{fig:fm_runtime}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{05_bloom_throughput.png}
+  \caption{Streaming throughput with and without Bloom Filter on 100K events. The Bloom Filter adds less than 5\% overhead.}
+  \label{fig:bloom_throughput}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{05_scaling_wikis.png}
+  \caption{MinHash pipeline runtime as more wikis are added. Runtime scales roughly linearly; enwiki dominates due to its 1.4M editor set.}
+  \label{fig:scaling_wikis}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{05_storage.png}
+  \caption{Storage size comparison across wikis: XML.gz source dumps vs Parquet output. Parquet with Snappy compression is consistently more compact after filtering.}
+  \label{fig:storage_scaling}
+\end{figure}
+
+All three probabilistic algorithms scale linearly with their tuning parameters ($k$ for FM Sketch and Bloom Filter, $n$ for MinHash), confirming their suitability for large-scale streaming pipelines. The Bloom Filter adds less than 5\% latency overhead, making it practical for high-throughput event streams.
+
+%--------------------------------------------------
+\section{Implementation Notes}
+
+\textbf{XML parsing:} Spark's spark-xml library fails on gzip-compressed Wikipedia dumps because gzip is a non-splittable format; all data funnels into a single partition causing out-of-memory errors. Our iterparse approach processes one revision at a time, using constant memory regardless of file size.
+
+\textbf{Streaming countDistinct:} Spark Structured Streaming does not support exact \texttt{countDistinct} in streaming aggregations. We replace it with \texttt{approx\_count\_distinct} (HyperLogLog), which is streaming-compatible.
+
+\textbf{SSE client compatibility:} \texttt{sseclient-py} 1.9.0 removed the \texttt{headers} keyword argument from its constructor. We wrote a minimal custom SSE parser using \texttt{requests.get(stream=True)} that correctly handles Wikimedia's required \texttt{User-Agent} header and automatic reconnection.
+
+\textbf{Spark batch memory:} Caching the full 101M-row dataset with \texttt{df.cache()} caused out-of-memory failures on an 8GB driver. We removed caching and increased the Spark driver memory to 8g via \texttt{spark.driver.memory}.
+
+%--------------------------------------------------
+\section{Dashboard}
+
+A four-tab Streamlit dashboard provides interactive visualization of all pipeline outputs:
+
+\begin{itemize}
+  \item \textbf{Trending Articles:} Bar chart of top-20 articles per wiki, selectable by wiki and time window. Updates as new streaming results arrive.
+  \item \textbf{FM Sketch Accuracy:} Scatter plot of FM estimate vs exact count and bar chart of MAPE at different $k$ values.
+  \item \textbf{Bloom Filter Evaluation:} Line charts of false positive rate vs $m$ and $k$; memory comparison bar chart.
+  \item \textbf{LSH Similarity:} Heatmap of exact Jaccard similarity between all 5 wikis; grouped bar chart of LSH precision and recall by band configuration; theoretical detection probability curves.
+\end{itemize}
+
+%--------------------------------------------------
+\section{Privacy: K-Anonymity}
+
+Wikipedia revision metadata includes contributor IDs and usernames, which -- even without article text -- can reveal editor identity through quasi-identifiers such as editing language, year, and activity level. We apply k-anonymity \cite{sweeney2002} to ensure no individual editor can be singled out from the published aggregate results.
+
+\subsection{Quasi-Identifier Selection}
+
+Three attributes serve as quasi-identifiers:
+\begin{itemize}
+  \item \textbf{wiki} -- which language edition the editor contributed to
+  \item \textbf{year} -- the calendar year of activity
+  \item \textbf{edit\_bucket} -- a generalised activity tier (Table~\ref{tab:buckets})
+\end{itemize}
+The sensitive attribute is \textbf{contributor\_id}. The output never exposes individual contributor IDs or usernames.
+
+\subsection{Generalisation: Edit Buckets}
+
+Exact edit counts form a near-unique quasi-identifier (a prolific editor with exactly 347 edits in a given year is easily re-identified). We generalise edit counts into five ordered buckets:
+
+\begin{table}[htbp]
+\caption{Edit Activity Generalisation Buckets}
+\label{tab:buckets}
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Bucket} & \textbf{Edit Count Range} & \textbf{Label} \\
+\midrule
+1 & exactly 1   & Single    \\
+2 & 2 -- 5      & Low       \\
+3 & 6 -- 20     & Medium    \\
+4 & 21 -- 100   & High      \\
+5 & $>$100      & Power     \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Suppression}
+
+A (wiki, year, edit\_bucket) group satisfies k-anonymity if at least $k$ distinct contributor IDs share that combination. Groups with fewer than $k$ distinct editors are suppressed (dropped) from all outputs.
+
+\subsection{Results}
+
+We evaluated k $\in \{2, 5, 10\}$ over the full 101M-revision dataset. Table~\ref{tab:kanon} summarises the suppression outcome.
+
+\begin{table}[htbp]
+\caption{K-Anonymity Suppression Results}
+\label{tab:kanon}
+\centering
+\begin{tabular}{rrrr}
+\toprule
+$k$ & Total Groups & Suppressed & Suppression Rate \\
+\midrule
+2  & 425 & 0 & 0.0\% \\
+5  & 425 & 0 & 0.0\% \\
+10 & 425 & 0 & 0.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Zero groups are suppressed at any tested $k$. The minimum observed group size across all 425 (wiki, year, bucket) combinations is thousands of distinct editors, far exceeding $k=10$. This is a positive privacy finding: the Wikipedia editing community is large enough that every quasi-identifier combination is shared by many editors, making re-identification via these attributes infeasible.
+
+Fig.~\ref{fig:kanon} shows the distribution of distinct editors across activity buckets and over time, confirming that all groups are well above any practical $k$ threshold.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\columnwidth]{06_k_anonymity.png}
+  \caption{K-anonymity analysis. \textit{Left:} distinct editors per activity bucket in 2024 (log scale) -- all groups vastly exceed $k=10$. \textit{Center:} minimum group size per bucket across all wikis and years; the red/orange/yellow lines mark $k=10/5/2$ thresholds. \textit{Right:} total k-anonymous editor activity by wiki and year ($k=5$).}
+  \label{fig:kanon}
+\end{figure}
+
+The inherent k-anonymity of this dataset arises from Wikipedia's scale: even the smallest wiki--year--bucket cell (Japanese Wikipedia, early years, power editors) contains hundreds of contributors. Our pipeline enforces this guarantee programmatically through the suppression step, ensuring that any change in data distribution that reduced group sizes below $k$ would automatically remove those groups from output.
+
+%--------------------------------------------------
+\section{Conclusion}
+
+%--------------------------------------------------
+\appendices
+
+\section{Appendix: Rubric Mapping and Evidence}
+
+\subsection*{Mandatory Questions}
+
+\textbf{Use of Generative AI:}  
+Yes, generative AI tools (e.g., ChatGPT) were used for writing refinement, debugging support, and presentation structuring. All code, experiments, and results were implemented and validated by the team.
+
+\textbf{Example prompts used:}
+\begin{itemize}
+    \item ``Improve wording of an IEEE project abstract''
+    \item ``Explain Spark streaming limitations and alternatives''
+    \item ``Suggest structure for big data project appendix''
+\end{itemize}
+
+\subsection*{Project Evidence}
+
+\textbf{GitHub Repository:}  
+\url{https://github.com/DipinJassal/wiki-edit-analytics}
+
+\textbf{Trello (Agile/Scrum):}  
+\url{https://trello.com/b/Hqblljyc/wikipedia-analytics-data-228}
+
+\textbf{Artifacts Submitted:}
+\begin{itemize}
+    \item Report (LaTeX, IEEE format)
+    \item Slides (PDF/PPTX)
+    \item Source code (.py / .ipynb)
+\end{itemize}
+
+\textbf{Streaming Algorithms:}  
+Bloom Filter, Flajolet-Martin Sketch, and MinHash + LSH implemented and evaluated.
+
+\textbf{Stream Processing Frameworks:}  
+Apache Spark (batch + streaming) and Kafka used for real-time processing.
+
+\textbf{Locality Sensitive Hashing:}  
+MinHash and LSH implemented from scratch with evaluation of precision/recall.
+
+\textbf{Version Control:}  
+GitHub used with continuous commits throughout development.
+
+\textbf{Agile / Scrum:}  
+Weekly task tracking and sprint-style planning via Trello.
+
+\textbf{Technical Difficulty:}  
+Processing 101M+ records, real-time ingestion, custom SSE parser, and scalable probabilistic algorithms.
+
+\textbf{Innovation:}  
+End-to-end pipeline combining batch + streaming + probabilistic data structures with dashboard visualization.
+
+\textbf{Lessons Learned:}
+\begin{itemize}
+    \item Gzip XML is not splittable in Spark
+    \item Approximate methods are required for streaming
+    \item Probabilistic structures trade accuracy for scalability
+\end{itemize}
+
+\textbf{Privacy Considerations:}
+K-anonymity is applied using (wiki, year, edit\_bucket) as quasi-identifiers with suppression for groups below threshold $k$. At $k=10$ across 425 groups, suppression rate is 0\% -- Wikipedia's scale ensures inherent k-anonymity. No contributor IDs or usernames appear in any pipeline output.
+
+\textbf{New Tools Used:}  
+Streamlit, Wikimedia EventStreams API, PyArrow, Trello.
+
+\textbf{System Diagram:}  
+Included in Fig.~\ref{fig:architecture}.
+
+\subsection*{Credit Statement}
+
+\begin{itemize}
+    \item Dipin Jassal: Conceptualization, implementation, analysis, writing
+    \item Sarvesh: Streaming pipeline, validation, writing
+    \item Anushka: Literature survey, experiments, visualization
+    \item Ishan: System design, debugging, evaluation
+    \item Samruddhi: Project management, documentation, presentation
+\end{itemize}
+
+We built and evaluated a complete big data pipeline for Wikipedia edit analytics combining batch processing (Apache Spark on 101M revisions), real-time streaming (Kafka and Spark Structured Streaming), and three probabilistic data structures implemented from scratch.
+
+Key findings:
+\begin{itemize}
+  \item Wikipedia language editions have largely disjoint editor communities (Jaccard 1.7--6.1\%), with German-French showing the greatest overlap and English-Japanese the least.
+  \item The Bloom Filter matches theoretical false positive rates empirically, providing a 4$\times$ memory reduction over exact sets at effectively zero false positive rate for our parameters.
+  \item FM Sketch achieves 43\% MAPE at $k=64$ using only 256 bytes -- acceptable for streaming cardinality monitoring where approximate counts suffice.
+  \item LSH banding requires fine-grained configuration ($b=128$, $r=1$) to detect candidate pairs in the low-Jaccard regime below 0.07.
+  \item HyperLogLog outperforms FM Sketch in accuracy (1.5\% vs 43\% MAPE); both serve different purposes -- HLL for production accuracy, FM Sketch as a from-scratch implementation demonstrating the core probabilistic principle.
+  \item All three algorithms scale linearly with their tuning parameters, confirming their practical suitability for large-scale streaming.
+  \item K-anonymity analysis on the full dataset shows zero suppressed groups at $k \leq 10$; every (wiki, year, edit\_bucket) combination contains thousands of distinct editors, confirming the aggregate is inherently privacy-preserving.
+\end{itemize}
+
+Future work could add a Count-Min Sketch for per-article edit frequency estimation, anomaly detection for edit-war identification, l-diversity or differential privacy extensions, and extension to additional language editions.
+
+%--------------------------------------------------
+\section*{Project Links}
+
+\noindent GitHub Repository: \url{https://github.com/DipinJassal/wiki-edit-analytics}
+
+\noindent Trello Dashboard: \url{https://trello.com/b/Hqblljyc/wikipedia-analytics-data-228}
+
+%--------------------------------------------------
+\begin{thebibliography}{00}
+
+\bibitem{bloom1970}
+B.~H. Bloom, ``Space/time trade-offs in hash coding with allowable errors,''
+\textit{Communications of the ACM}, vol.~13, no.~7, pp.~422--426, 1970.
+
+\bibitem{flajolet1985}
+P.~Flajolet and G.~N. Martin, ``Probabilistic counting algorithms for data base applications,''
+\textit{Journal of Computer and System Sciences}, vol.~31, no.~2, pp.~182--209, 1985.
+
+\bibitem{flajolet2007}
+P.~Flajolet, {\'E}.~Fusy, O.~Gandouet, and F.~Meunier, ``HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm,''
+\textit{Discrete Mathematics and Theoretical Computer Science}, pp.~137--156, 2007.
+
+\bibitem{broder1997}
+A.~Z. Broder, ``On the resemblance and containment of documents,''
+\textit{Proceedings of the Compression and Complexity of Sequences}, pp.~21--29, 1997.
+
+\bibitem{indyk1998}
+P.~Indyk and R.~Motwani, ``Approximate nearest neighbors: towards removing the curse of dimensionality,''
+\textit{Proceedings of the 30th Annual ACM Symposium on Theory of Computing (STOC)}, pp.~604--613, 1998.
+
+\bibitem{potthast2008}
+M.~Potthast, B.~Stein, and R.~Gerling, ``Automatic vandalism detection in Wikipedia,''
+\textit{Advances in Information Retrieval}, pp.~663--668, 2008.
+
+\bibitem{welser2011}
+H.~T. Welser, D.~Cosley, G.~Kossinets, A.~Lin, F.~Dokshin, G.~Gay, and M.~Smith, ``Finding social roles in Wikipedia,''
+\textit{Proceedings of the 2011 iConference}, pp.~122--129, 2011.
+
+\bibitem{callahan2011}
+E.~S. Callahan and J.~Herring, ``Cultural bias in Wikipedia content on famous persons,''
+\textit{Journal of the American Society for Information Science and Technology}, vol.~62, no.~10, pp.~1899--1915, 2011.
+
+\bibitem{sweeney2002}
+L.~Sweeney, ``k-anonymity: a model for protecting privacy,''
+\textit{International Journal of Uncertainty, Fuzziness and Knowledge-Based Systems}, vol.~10, no.~5, pp.~557--570, 2002.
+
+\end{thebibliography}
+
+\end{document}
